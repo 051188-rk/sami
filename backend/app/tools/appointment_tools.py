@@ -1,0 +1,459 @@
+"""
+LangChain tools for hospital appointment management.
+
+Each tool:
+  1. Performs database operations via SQLAlchemy async sessions
+  2. Broadcasts a LiveKit data message to the room so the frontend can
+     show real-time tool execution status
+"""
+
+import json
+import logging
+from datetime import datetime
+from typing import Optional
+
+from langchain_core.tools import tool
+from sqlalchemy import and_, select
+
+from app.db.database import AsyncSessionLocal
+from app.db.seed import AVAILABLE_SLOTS, DOCTORS
+from app.models.models import Appointment, Doctor, User
+from app.services.sms_service import send_sms_confirmation
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+async def _broadcast(room, event_type: str, payload: dict):
+    """Send a LiveKit data message to all participants in the room."""
+    if room is None:
+        return
+    try:
+        msg = json.dumps({"type": event_type, **payload}).encode()
+        await room.local_participant.publish_data(msg, reliable=True)
+    except Exception as exc:
+        logger.warning("Failed to broadcast %s: %s", event_type, exc)
+
+
+def _format_appointments(appointments: list) -> list[dict]:
+    return [
+        {
+            "id": a.id,
+            "doctor": a.doctor.name,
+            "specialization": a.doctor.specialization,
+            "date": a.date,
+            "time": a.time,
+            "status": a.status,
+        }
+        for a in appointments
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Session state — shared across tools within one conversation
+# ---------------------------------------------------------------------------
+
+class SessionState:
+    """Holds per-conversation state (user identity + room reference)."""
+
+    def __init__(self, session_id: str, room=None):
+        self.session_id = session_id
+        self.room = room
+        self.user_phone: Optional[str] = None
+        self.user_id: Optional[int] = None
+        self.user_name: Optional[str] = None
+        self.summary: Optional[dict] = None
+
+
+# ---------------------------------------------------------------------------
+# Tool factory — returns bound LangChain tools for a given session
+# ---------------------------------------------------------------------------
+
+def create_tools(state: SessionState):
+    """Return all LangChain tools bound to the given session state."""
+
+    @tool
+    async def identify_user(phone_number: str, name: str = "") -> str:
+        """
+        Identify or register a patient by their phone number.
+        Call this first before any appointment operation.
+        phone_number: patient's phone number (digits only, with country code)
+        name: patient's full name (optional on first call, required if new)
+        """
+        await _broadcast(state.room, "tool_start", {"tool": "identify_user", "label": "Identifying patient..."})
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(User).where(User.phone_number == phone_number))
+            user = result.scalar_one_or_none()
+
+            if user:
+                state.user_phone = user.phone_number
+                state.user_id = user.id
+                state.user_name = user.name
+                await _broadcast(state.room, "tool_complete", {
+                    "tool": "identify_user",
+                    "label": f"Welcome back, {user.name}",
+                    "success": True,
+                })
+                return f"User identified: {user.name} (ID: {user.id})"
+            else:
+                if not name:
+                    await _broadcast(state.room, "tool_complete", {
+                        "tool": "identify_user",
+                        "label": "New patient — name required",
+                        "success": False,
+                    })
+                    return "User not found. Please provide patient's full name to register."
+
+                new_user = User(name=name, phone_number=phone_number)
+                session.add(new_user)
+                await session.commit()
+                await session.refresh(new_user)
+
+                state.user_phone = new_user.phone_number
+                state.user_id = new_user.id
+                state.user_name = new_user.name
+
+                await _broadcast(state.room, "tool_complete", {
+                    "tool": "identify_user",
+                    "label": f"Registered new patient: {name}",
+                    "success": True,
+                })
+                return f"New patient registered: {name} (ID: {new_user.id})"
+
+    @tool
+    async def fetch_slots(doctor_id: Optional[int] = None, specialization: Optional[str] = None) -> str:
+        """
+        Fetch available appointment slots.
+        Optionally filter by doctor_id or specialization.
+        Returns a list of doctors with their available dates and times.
+        """
+        await _broadcast(state.room, "tool_start", {"tool": "fetch_slots", "label": "Fetching available slots..."})
+
+        result = []
+        for doc in DOCTORS:
+            if doctor_id and doc["id"] != doctor_id:
+                continue
+            if specialization and specialization.lower() not in doc["specialization"].lower():
+                continue
+
+            slots = AVAILABLE_SLOTS.get(doc["id"], {})
+            result.append({
+                "doctor_id": doc["id"],
+                "doctor": doc["name"],
+                "specialization": doc["specialization"],
+                "available_slots": slots,
+            })
+
+        await _broadcast(state.room, "tool_complete", {
+            "tool": "fetch_slots",
+            "label": f"Found {len(result)} doctor(s) with slots",
+            "success": True,
+        })
+
+        return json.dumps(result, indent=2)
+
+    @tool
+    async def book_appointment(doctor_id: int, date: str, time: str) -> str:
+        """
+        Book an appointment for the identified patient.
+        Requires identify_user to be called first.
+        doctor_id: integer ID of the doctor
+        date: appointment date in YYYY-MM-DD format
+        time: appointment time in HH:MM format (24-hour)
+        """
+        if not state.user_id:
+            return "Error: Patient not identified. Please call identify_user first."
+
+        await _broadcast(state.room, "tool_start", {"tool": "book_appointment", "label": "Booking appointment..."})
+
+        async with AsyncSessionLocal() as session:
+            # Check for double booking
+            conflict = await session.execute(
+                select(Appointment).where(
+                    and_(
+                        Appointment.doctor_id == doctor_id,
+                        Appointment.date == date,
+                        Appointment.time == time,
+                        Appointment.status == "confirmed",
+                    )
+                )
+            )
+            if conflict.scalar_one_or_none():
+                await _broadcast(state.room, "tool_complete", {
+                    "tool": "book_appointment",
+                    "label": "Slot already booked — conflict",
+                    "success": False,
+                })
+                return f"Error: The slot on {date} at {time} is already booked. Please choose another time."
+
+            # Fetch doctor info
+            doc_result = await session.execute(select(Doctor).where(Doctor.id == doctor_id))
+            doctor = doc_result.scalar_one_or_none()
+            if not doctor:
+                return f"Error: Doctor with ID {doctor_id} not found."
+
+            appt = Appointment(
+                user_id=state.user_id,
+                doctor_id=doctor_id,
+                date=date,
+                time=time,
+                status="confirmed",
+            )
+            session.add(appt)
+            await session.commit()
+            await session.refresh(appt)
+
+        # Send SMS confirmation
+        if state.user_phone:
+            await send_sms_confirmation(
+                to_number=state.user_phone,
+                patient_name=state.user_name or "Patient",
+                doctor_name=doctor.name,
+                date=date,
+                time=time,
+            )
+
+        await _broadcast(state.room, "tool_complete", {
+            "tool": "book_appointment",
+            "label": f"Appointment confirmed with {doctor.name} on {date} at {time}",
+            "success": True,
+            "data": {
+                "appointment_id": appt.id,
+                "doctor": doctor.name,
+                "date": date,
+                "time": time,
+            },
+        })
+
+        return (
+            f"Appointment booked successfully! "
+            f"Confirmation ID: {appt.id}. "
+            f"Doctor: {doctor.name} ({doctor.specialization}). "
+            f"Date: {date} at {time}. "
+            f"SMS confirmation sent to {state.user_phone}."
+        )
+
+    @tool
+    async def retrieve_appointments() -> str:
+        """
+        Retrieve all appointments for the currently identified patient.
+        Requires identify_user to be called first.
+        """
+        if not state.user_id:
+            return "Error: Patient not identified. Please call identify_user first."
+
+        await _broadcast(state.room, "tool_start", {
+            "tool": "retrieve_appointments",
+            "label": "Fetching your appointments...",
+        })
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Appointment)
+                .where(Appointment.user_id == state.user_id)
+                .join(Doctor)
+            )
+            appointments = result.scalars().all()
+
+            # Eagerly load relationships
+            formatted = []
+            for a in appointments:
+                doc_result = await session.execute(select(Doctor).where(Doctor.id == a.doctor_id))
+                doctor = doc_result.scalar_one_or_none()
+                formatted.append({
+                    "id": a.id,
+                    "doctor": doctor.name if doctor else "Unknown",
+                    "specialization": doctor.specialization if doctor else "",
+                    "date": a.date,
+                    "time": a.time,
+                    "status": a.status,
+                })
+
+        await _broadcast(state.room, "tool_complete", {
+            "tool": "retrieve_appointments",
+            "label": f"Found {len(formatted)} appointment(s)",
+            "success": True,
+            "data": {"appointments": formatted},
+        })
+
+        if not formatted:
+            return "You have no appointments on record."
+
+        return json.dumps(formatted, indent=2)
+
+    @tool
+    async def cancel_appointment(appointment_id: int) -> str:
+        """
+        Cancel an appointment by its ID.
+        appointment_id: the numeric ID of the appointment to cancel
+        """
+        if not state.user_id:
+            return "Error: Patient not identified. Please call identify_user first."
+
+        await _broadcast(state.room, "tool_start", {
+            "tool": "cancel_appointment",
+            "label": f"Cancelling appointment #{appointment_id}...",
+        })
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Appointment).where(
+                    and_(Appointment.id == appointment_id, Appointment.user_id == state.user_id)
+                )
+            )
+            appt = result.scalar_one_or_none()
+
+            if not appt:
+                await _broadcast(state.room, "tool_complete", {
+                    "tool": "cancel_appointment",
+                    "label": "Appointment not found",
+                    "success": False,
+                })
+                return f"Error: Appointment {appointment_id} not found or does not belong to you."
+
+            if appt.status == "cancelled":
+                return f"Appointment {appointment_id} is already cancelled."
+
+            appt.status = "cancelled"
+            await session.commit()
+
+        await _broadcast(state.room, "tool_complete", {
+            "tool": "cancel_appointment",
+            "label": f"Appointment #{appointment_id} cancelled",
+            "success": True,
+        })
+
+        return f"Appointment {appointment_id} has been successfully cancelled."
+
+    @tool
+    async def modify_appointment(appointment_id: int, new_date: str, new_time: str) -> str:
+        """
+        Reschedule an existing appointment to a new date and time.
+        appointment_id: the numeric ID of the appointment to modify
+        new_date: new date in YYYY-MM-DD format
+        new_time: new time in HH:MM format (24-hour)
+        """
+        if not state.user_id:
+            return "Error: Patient not identified. Please call identify_user first."
+
+        await _broadcast(state.room, "tool_start", {
+            "tool": "modify_appointment",
+            "label": f"Rescheduling appointment #{appointment_id}...",
+        })
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Appointment).where(
+                    and_(Appointment.id == appointment_id, Appointment.user_id == state.user_id)
+                )
+            )
+            appt = result.scalar_one_or_none()
+
+            if not appt:
+                await _broadcast(state.room, "tool_complete", {
+                    "tool": "modify_appointment",
+                    "label": "Appointment not found",
+                    "success": False,
+                })
+                return f"Error: Appointment {appointment_id} not found or does not belong to you."
+
+            # Check new slot isn't already booked
+            conflict = await session.execute(
+                select(Appointment).where(
+                    and_(
+                        Appointment.doctor_id == appt.doctor_id,
+                        Appointment.date == new_date,
+                        Appointment.time == new_time,
+                        Appointment.status == "confirmed",
+                        Appointment.id != appointment_id,
+                    )
+                )
+            )
+            if conflict.scalar_one_or_none():
+                await _broadcast(state.room, "tool_complete", {
+                    "tool": "modify_appointment",
+                    "label": "New slot has a conflict",
+                    "success": False,
+                })
+                return f"Error: The new slot on {new_date} at {new_time} is already booked. Please choose another time."
+
+            old_date, old_time = appt.date, appt.time
+            appt.date = new_date
+            appt.time = new_time
+            await session.commit()
+
+        await _broadcast(state.room, "tool_complete", {
+            "tool": "modify_appointment",
+            "label": f"Rescheduled from {old_date} {old_time} to {new_date} {new_time}",
+            "success": True,
+        })
+
+        return (
+            f"Appointment {appointment_id} rescheduled from {old_date} at {old_time} "
+            f"to {new_date} at {new_time}."
+        )
+
+    @tool
+    async def end_conversation() -> str:
+        """
+        End the conversation and generate a structured summary.
+        Call this when the patient says goodbye or the conversation is complete.
+        """
+        from app.services.summary_service import generate_summary
+
+        await _broadcast(state.room, "tool_start", {
+            "tool": "end_conversation",
+            "label": "Generating conversation summary...",
+        })
+
+        # Fetch user appointments for summary
+        appointments_data = []
+        if state.user_id:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(Appointment).where(Appointment.user_id == state.user_id)
+                )
+                appts = result.scalars().all()
+                for a in appts:
+                    doc_result = await session.execute(select(Doctor).where(Doctor.id == a.doctor_id))
+                    doctor = doc_result.scalar_one_or_none()
+                    appointments_data.append({
+                        "id": a.id,
+                        "doctor": doctor.name if doctor else "Unknown",
+                        "specialization": doctor.specialization if doctor else "",
+                        "date": a.date,
+                        "time": a.time,
+                        "status": a.status,
+                    })
+
+        summary = await generate_summary(
+            session_id=state.session_id,
+            user_name=state.user_name,
+            user_phone=state.user_phone,
+            appointments=appointments_data,
+        )
+
+        state.summary = summary
+
+        await _broadcast(state.room, "summary", {
+            "tool": "end_conversation",
+            "label": "Summary ready",
+            "success": True,
+            "data": summary,
+        })
+
+        return "Summary generated. Goodbye! Have a great day and stay healthy."
+
+    return [
+        identify_user,
+        fetch_slots,
+        book_appointment,
+        retrieve_appointments,
+        cancel_appointment,
+        modify_appointment,
+        end_conversation,
+    ]
