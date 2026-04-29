@@ -1,5 +1,5 @@
 """
-Hospital AI Voice Agent — LiveKit Worker
+Hospital AI Voice Agent — LiveKit Worker (livekit-agents 0.8.12)
 
 Architecture:
   Deepgram STT → LangChain AgentExecutor (Gemini) → Cartesia TTS
@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -22,7 +23,6 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from livekit import rtc
 from livekit.agents import (
     AutoSubscribe,
     JobContext,
@@ -51,7 +51,7 @@ Guidelines:
 - Never make up doctor names or slots — always use fetch_slots tool
 - Maintain a natural conversational flow across multiple turns
 
-You have access to these tools:
+Available tools:
 - identify_user: Register or look up a patient by phone number
 - fetch_slots: Get available appointment slots for doctors
 - book_appointment: Book a slot for the identified patient
@@ -66,6 +66,7 @@ Always be warm, professional, and efficient.
 
 # ---------------------------------------------------------------------------
 # Custom LLM: wraps LangChain AgentExecutor inside LiveKit's LLM interface
+# Compatible with livekit-agents 0.8.x
 # ---------------------------------------------------------------------------
 
 class LangChainLLM(lk_llm.LLM):
@@ -110,42 +111,50 @@ class LangChainLLM(lk_llm.LLM):
             handle_parsing_errors=True,
         )
 
+    # 0.8.x LLM.chat signature: (*, chat_ctx, fnc_ctx=None) → LLMStream
     def chat(
         self,
         *,
         chat_ctx: lk_llm.ChatContext,
-        fnc_ctx=None,
+        fnc_ctx: Optional[lk_llm.FunctionContext] = None,
     ) -> "LangChainLLMStream":
         return LangChainLLMStream(
             executor=self._executor,
             chat_ctx=chat_ctx,
             history=self._chat_history,
-            llm=self,
         )
 
 
 class LangChainLLMStream(lk_llm.LLMStream):
-    def __init__(self, executor, chat_ctx: lk_llm.ChatContext, history: list, llm):
-        super().__init__(llm, chat_ctx=chat_ctx, fnc_ctx=None)
+    """
+    LLMStream implementation for livekit-agents 0.8.x.
+
+    In 0.8.x, LLMStream.__init__ signature is:
+        __init__(self, *, chat_ctx: ChatContext, fnc_ctx: FunctionContext | None)
+    The stream sends chunks via self._event_ch (an aio.Chan[ChatChunk]).
+    """
+
+    def __init__(self, executor, chat_ctx: lk_llm.ChatContext, history: list):
+        # 0.8.x: no 'llm' positional argument in super().__init__
+        super().__init__(chat_ctx=chat_ctx, fnc_ctx=None)
         self._executor = executor
         self._history = history
 
     async def _run(self):
         from langchain_core.messages import AIMessage, HumanMessage
 
-        # Extract last user message from chat context
-        messages = self._chat_ctx.messages
+        # Extract the last user message from chat context
         user_text = ""
-        for msg in reversed(messages):
+        for msg in reversed(self._chat_ctx.messages):
             if msg.role == "user":
-                user_text = msg.content if isinstance(msg.content, str) else ""
+                content = msg.content
+                user_text = content if isinstance(content, str) else ""
                 break
 
         if not user_text:
             return
 
         try:
-            # Run LangChain agent in thread pool (sync executor)
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None,
@@ -156,11 +165,9 @@ class LangChainLLMStream(lk_llm.LLMStream):
             )
             response_text = result.get("output", "I'm sorry, I didn't understand that.")
 
-            # Update conversation history
+            # Maintain rolling conversation history (max 20 messages = 10 turns)
             self._history.append(HumanMessage(content=user_text))
             self._history.append(AIMessage(content=response_text))
-
-            # Keep history bounded to last 10 turns (20 messages)
             if len(self._history) > 20:
                 self._history = self._history[-20:]
 
@@ -168,7 +175,7 @@ class LangChainLLMStream(lk_llm.LLMStream):
             logger.exception("LangChain agent error: %s", exc)
             response_text = "I'm sorry, I encountered an issue. Please try again."
 
-        # Emit the response as a single chunk
+        # Emit the full response as one chunk — LiveKit TTS streams it
         self._event_ch.send_nowait(
             lk_llm.ChatChunk(
                 choices=[
@@ -205,20 +212,21 @@ async def entrypoint(ctx: JobContext):
 
     tts = cartesia.TTS(
         api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="248be419-c632-4f23-adf1-5324ed7dbf1d",  # Friendly female voice
+        voice="248be419-c632-4f23-adf1-5324ed7dbf1d",  # Friendly female voice
         model="sonic-english",
     )
 
+    # 0.8.x VoicePipelineAgent: vad is first positional arg (can be None)
     agent = VoicePipelineAgent(
         vad=None,
         stt=stt,
         llm=langchain_llm,
         tts=tts,
-        min_endpointing_delay=0.5,
         allow_interruptions=True,
     )
 
-    # Broadcast transcripts to frontend via data channel
+    # Broadcast transcripts + state to frontend via LiveKit data channel
+
     @agent.on("user_speech_committed")
     def on_user_speech(msg: lk_llm.ChatMessage):
         payload = json.dumps({
@@ -257,14 +265,14 @@ async def entrypoint(ctx: JobContext):
 
     agent.start(ctx.room)
 
-    # Greet the patient
-    await agent.say(
+    # Initial greeting
+    agent.say(
         "Hello! Welcome to City General Hospital. I'm your AI receptionist. "
         "How can I help you today? I can help you book, manage, or cancel appointments.",
         allow_interruptions=True,
     )
 
-    # Keep agent alive until room is empty
+    # Keep alive for up to 1 hour
     await asyncio.sleep(3600)
 
 
