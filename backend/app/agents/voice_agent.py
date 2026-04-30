@@ -2,7 +2,7 @@
 Hospital AI Voice Agent — LiveKit Worker (livekit-agents 0.8.12)
 
 Architecture:
-  Deepgram STT → LangChain AgentExecutor (Gemini) → Cartesia TTS
+  Silero VAD → Deepgram STT → LangChain AgentExecutor (Gemini) → Cartesia TTS
   Tool events are broadcast via LiveKit data channel to the frontend.
 
 Run with:
@@ -67,16 +67,106 @@ Always be warm, professional, and efficient.
 
 
 # ---------------------------------------------------------------------------
-# Custom LLM: wraps LangChain AgentExecutor inside LiveKit's LLM interface
-# Compatible with livekit-agents 0.8.x
+# LangChainLLMStream — correct 0.8.12 implementation
+#
+# In 0.8.12 LLMStream is a pure async iterator:
+#   - __init__(self, *, chat_ctx, fnc_ctx)
+#   - abstract __anext__(self) -> ChatChunk
+#
+# We spin up a background task that runs the LangChain AgentExecutor and
+# deposits the result into an asyncio.Queue. __anext__ reads from that queue.
+# ---------------------------------------------------------------------------
+
+class LangChainLLMStream(lk_llm.LLMStream):
+    def __init__(
+        self,
+        executor,
+        chat_ctx: lk_llm.ChatContext,
+        history: list,
+    ):
+        super().__init__(chat_ctx=chat_ctx, fnc_ctx=None)
+        self._executor = executor
+        self._history = history
+        # Queue carries ChatChunk items; None signals end-of-stream
+        self._queue: asyncio.Queue[Optional[lk_llm.ChatChunk]] = asyncio.Queue()
+        # Schedule generation immediately
+        self._gen_task = asyncio.ensure_future(self._generate())
+
+    async def _generate(self) -> None:
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        user_text = ""
+        for msg in reversed(self._chat_ctx.messages):
+            if msg.role == "user":
+                content = msg.content
+                user_text = content if isinstance(content, str) else ""
+                break
+
+        if not user_text:
+            await self._queue.put(None)
+            return
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: self._executor.invoke({
+                    "input": user_text,
+                    "chat_history": self._history,
+                }),
+            )
+            response_text = result.get("output", "I'm sorry, I didn't understand that.")
+
+            # Maintain rolling history (max 10 turns = 20 messages)
+            self._history.append(HumanMessage(content=user_text))
+            self._history.append(AIMessage(content=response_text))
+            if len(self._history) > 20:
+                self._history = self._history[-20:]
+
+            chunk = lk_llm.ChatChunk(
+                choices=[
+                    lk_llm.Choice(
+                        delta=lk_llm.ChoiceDelta(
+                            role="assistant",
+                            content=response_text,
+                        ),
+                        index=0,
+                    )
+                ]
+            )
+            await self._queue.put(chunk)
+
+        except Exception as exc:
+            logger.exception("LangChain agent error: %s", exc)
+            await self._queue.put(
+                lk_llm.ChatChunk(
+                    choices=[
+                        lk_llm.Choice(
+                            delta=lk_llm.ChoiceDelta(
+                                role="assistant",
+                                content="I'm sorry, I encountered an issue. Could you please repeat that?",
+                            ),
+                            index=0,
+                        )
+                    ]
+                )
+            )
+        finally:
+            # Signal end of stream
+            await self._queue.put(None)
+
+    async def __anext__(self) -> lk_llm.ChatChunk:
+        item = await self._queue.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+
+# ---------------------------------------------------------------------------
+# LangChainLLM — wraps AgentExecutor as a LiveKit LLM plugin
 # ---------------------------------------------------------------------------
 
 class LangChainLLM(lk_llm.LLM):
-    """
-    A LiveKit LLM plugin that delegates to a LangChain AgentExecutor
-    backed by Gemini 1.5 Pro with tool calling.
-    """
-
     def __init__(self, state: SessionState):
         super().__init__()
         self._state = state
@@ -113,80 +203,16 @@ class LangChainLLM(lk_llm.LLM):
             handle_parsing_errors=True,
         )
 
-    # 0.8.x LLM.chat signature: (*, chat_ctx, fnc_ctx=None) → LLMStream
     def chat(
         self,
         *,
         chat_ctx: lk_llm.ChatContext,
         fnc_ctx: Optional[lk_llm.FunctionContext] = None,
-    ) -> "LangChainLLMStream":
+    ) -> LangChainLLMStream:
         return LangChainLLMStream(
             executor=self._executor,
             chat_ctx=chat_ctx,
             history=self._chat_history,
-        )
-
-
-class LangChainLLMStream(lk_llm.LLMStream):
-    """
-    LLMStream implementation for livekit-agents 0.8.x.
-
-    In 0.8.x, LLMStream.__init__ signature is:
-        __init__(self, *, chat_ctx: ChatContext, fnc_ctx: FunctionContext | None)
-    The stream sends chunks via self._event_ch (an aio.Chan[ChatChunk]).
-    """
-
-    def __init__(self, executor, chat_ctx: lk_llm.ChatContext, history: list):
-        # 0.8.x: no 'llm' positional argument in super().__init__
-        super().__init__(chat_ctx=chat_ctx, fnc_ctx=None)
-        self._executor = executor
-        self._history = history
-
-    async def _run(self):
-        from langchain_core.messages import AIMessage, HumanMessage
-
-        # Extract the last user message from chat context
-        user_text = ""
-        for msg in reversed(self._chat_ctx.messages):
-            if msg.role == "user":
-                content = msg.content
-                user_text = content if isinstance(content, str) else ""
-                break
-
-        if not user_text:
-            return
-
-        try:
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: self._executor.invoke({
-                    "input": user_text,
-                    "chat_history": self._history,
-                }),
-            )
-            response_text = result.get("output", "I'm sorry, I didn't understand that.")
-
-            # Maintain rolling conversation history (max 20 messages = 10 turns)
-            self._history.append(HumanMessage(content=user_text))
-            self._history.append(AIMessage(content=response_text))
-            if len(self._history) > 20:
-                self._history = self._history[-20:]
-
-        except Exception as exc:
-            logger.exception("LangChain agent error: %s", exc)
-            response_text = "I'm sorry, I encountered an issue. Please try again."
-
-        # Emit the full response as one chunk — LiveKit TTS streams it
-        self._event_ch.send_nowait(
-            lk_llm.ChatChunk(
-                choices=[
-                    lk_llm.Choice(
-                        delta=lk_llm.ChoiceDelta(role="assistant", content=response_text),
-                        index=0,
-                    )
-                ]
-            )
         )
 
 
@@ -204,6 +230,8 @@ async def entrypoint(ctx: JobContext):
 
     langchain_llm = LangChainLLM(state=state)
 
+    vad = SileroVAD.load()
+
     stt = deepgram.STT(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
         model="nova-2",
@@ -214,11 +242,9 @@ async def entrypoint(ctx: JobContext):
 
     tts = cartesia.TTS(
         api_key=os.getenv("CARTESIA_API_KEY"),
-        voice="248be419-c632-4f23-adf1-5324ed7dbf1d",  # Friendly female voice
+        voice="248be419-c632-4f23-adf1-5324ed7dbf1d",
         model="sonic-english",
     )
-
-    vad = SileroVAD.load()
 
     agent = VoiceAssistant(
         vad=vad,
@@ -228,7 +254,7 @@ async def entrypoint(ctx: JobContext):
         allow_interruptions=True,
     )
 
-    # Broadcast transcripts + state to frontend via LiveKit data channel
+    # Broadcast transcripts to frontend via LiveKit data channel
 
     @agent.on("user_speech_committed")
     def on_user_speech(msg: lk_llm.ChatMessage):
@@ -268,8 +294,8 @@ async def entrypoint(ctx: JobContext):
 
     agent.start(ctx.room)
 
-    # Initial greeting
-    agent.say(
+    # VoiceAssistant.say() is a coroutine in 0.8.12 — must be awaited
+    await agent.say(
         "Hello! Welcome to City General Hospital. I'm your AI receptionist. "
         "How can I help you today? I can help you book, manage, or cancel appointments.",
         allow_interruptions=True,
@@ -280,27 +306,9 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "direct":
-        # Direct worker execution (for debugging)
-        from livekit.agents import Worker
-        import asyncio
-        
-        async def run_direct():
-            worker = Worker(
-                WorkerOptions(
-                    entrypoint_fnc=entrypoint,
-                    worker_type=WorkerType.ROOM,
-                )
-            )
-            await worker.run()
-        
-        asyncio.run(run_direct())
-    else:
-        # Default CLI execution
-        cli.run_app(
-            WorkerOptions(
-                entrypoint_fnc=entrypoint,
-                worker_type=WorkerType.ROOM,
-            )
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            worker_type=WorkerType.ROOM,
         )
+    )
