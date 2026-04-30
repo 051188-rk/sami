@@ -91,11 +91,15 @@ Return ONLY valid JSON with this exact schema:
 
     if gemini_key:
         try:
-            import google.generativeai as genai
+            from google import genai
+            from google.genai import types as genai_types
 
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel("gemini-1.5-pro")
-            response = model.generate_content(prompt)
+            client = genai.Client(api_key=gemini_key)
+            response = client.models.generate_content(
+                model="gemini-1.5-pro",
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(temperature=0.3),
+            )
             raw = response.text.strip()
 
             # Strip markdown code fences if present

@@ -33,6 +33,7 @@ from livekit.agents import (
 )
 from livekit.agents.voice_assistant import VoiceAssistant
 from livekit.plugins import cartesia, deepgram
+from livekit.plugins.silero import VAD as SileroVAD
 
 from app.tools.appointment_tools import SessionState, create_tools
 
@@ -217,11 +218,14 @@ async def entrypoint(ctx: JobContext):
         model="sonic-english",
     )
 
-    # VoiceAssistant: use the updated API
+    vad = SileroVAD.load()
+
     agent = VoiceAssistant(
+        vad=vad,
         stt=stt,
         llm=langchain_llm,
         tts=tts,
+        allow_interruptions=True,
     )
 
     # Broadcast transcripts + state to frontend via LiveKit data channel
