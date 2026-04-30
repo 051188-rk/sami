@@ -27,10 +27,11 @@ from livekit.agents import (
     AutoSubscribe,
     JobContext,
     WorkerOptions,
+    WorkerType,
     cli,
     llm as lk_llm,
 )
-from livekit.agents.pipeline import VoicePipelineAgent
+from livekit.agents.voice_assistant import VoiceAssistant
 from livekit.plugins import cartesia, deepgram
 
 from app.tools.appointment_tools import SessionState, create_tools
@@ -216,13 +217,11 @@ async def entrypoint(ctx: JobContext):
         model="sonic-english",
     )
 
-    # 0.8.x VoicePipelineAgent: vad is first positional arg (can be None)
-    agent = VoicePipelineAgent(
-        vad=None,
+    # VoiceAssistant: use the updated API
+    agent = VoiceAssistant(
         stt=stt,
         llm=langchain_llm,
         tts=tts,
-        allow_interruptions=True,
     )
 
     # Broadcast transcripts + state to frontend via LiveKit data channel
@@ -277,9 +276,27 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            worker_type="room",
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "direct":
+        # Direct worker execution (for debugging)
+        from livekit.agents import Worker
+        import asyncio
+        
+        async def run_direct():
+            worker = Worker(
+                WorkerOptions(
+                    entrypoint_fnc=entrypoint,
+                    worker_type=WorkerType.ROOM,
+                )
+            )
+            await worker.run()
+        
+        asyncio.run(run_direct())
+    else:
+        # Default CLI execution
+        cli.run_app(
+            WorkerOptions(
+                entrypoint_fnc=entrypoint,
+                worker_type=WorkerType.ROOM,
+            )
         )
-    )

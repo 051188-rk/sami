@@ -23,13 +23,14 @@ export default function AppointmentPanel({ events, sessionState }: AppointmentPa
         event.tool === "book_appointment" &&
         event.status === "complete" &&
         event.success &&
-        event.data.appointment_id
+        event.data?.appointment_id
       ) {
+        const d = event.data as Record<string, string | number>;
         all.push({
-          id: event.data.appointment_id,
-          doctor: event.data.doctor,
-          date: event.data.date,
-          time: event.data.time,
+          id: d.appointment_id as number,
+          doctor: d.doctor as string,
+          date: d.date as string,
+          time: d.time as string,
           status: "confirmed",
         });
       }
@@ -37,7 +38,7 @@ export default function AppointmentPanel({ events, sessionState }: AppointmentPa
       // From retrieve_appointments
       if (
         event.tool === "retrieve_appointments" &&
-        event.data.appointments
+        event.data?.appointments
       ) {
         for (const a of event.data.appointments as AppointmentData[]) {
           if (!all.find((x) => x.id === a.id)) {
@@ -48,7 +49,7 @@ export default function AppointmentPanel({ events, sessionState }: AppointmentPa
 
       // Update status on cancel
       if (event.tool === "cancel_appointment" && event.success) {
-        const apptId = event.data?.appointment_id;
+        const apptId = event.data?.appointment_id as number | undefined;
         if (apptId) {
           const found = all.find((a) => a.id === apptId);
           if (found) found.status = "cancelled";

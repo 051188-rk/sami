@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { RiMicLine, RiPhoneLine, RiPhoneOffLine, RiLoader4Line } from "react-icons/ri";
+import { RiMicLine, RiPhoneLine, RiLoader4Line } from "react-icons/ri";
 
 interface VoiceInterfaceProps {
   sessionState: "idle" | "connecting" | "active" | "ended";
@@ -117,9 +117,9 @@ function CallButton({
       <motion.button
         whileTap={{ scale: 0.95 }}
         onClick={onEnd}
-        className="flex items-center gap-2 px-5 py-2.5 bg-white text-black rounded-full text-sm font-semibold hover:bg-[#ddd] transition-colors"
+        className="flex items-center gap-2 px-5 py-2.5 bg-red-600 text-white rounded-full text-sm font-semibold hover:bg-red-700 transition-colors"
       >
-        <RiPhoneOffLine size={16} />
+        <RiPhoneLine size={16} />
         End Call
       </motion.button>
     );
