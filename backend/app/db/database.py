@@ -2,7 +2,8 @@ import os
 
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
+from sqlalchemy import create_engine
 
 load_dotenv()
 
@@ -12,6 +13,10 @@ ASYNC_DATABASE_URL = DATABASE_URL.replace("sqlite://", "sqlite+aiosqlite://")
 
 engine = create_async_engine(ASYNC_DATABASE_URL, echo=False)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+# Sync session for LangChain tools
+sync_engine = create_engine(DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(bind=sync_engine, expire_on_commit=False)
 
 
 class Base(DeclarativeBase):
